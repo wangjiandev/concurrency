@@ -1,9 +1,13 @@
+use crate::vector::{dot_product, Vector};
+use anyhow::{anyhow, Result};
 use std::{
     fmt::{self, Debug, Display, Formatter},
     ops::{Add, AddAssign, Mul},
+    sync::mpsc,
+    thread,
 };
 
-use anyhow::{anyhow, Result};
+const NUM_THREADS: usize = 4;
 
 pub struct Matrix<T> {
     data: Vec<T>,
@@ -56,21 +60,86 @@ where
     }
 }
 
+pub struct MsgInput<T> {
+    idx: usize,
+    row: Vector<T>,
+    col: Vector<T>,
+}
+
+impl<T> MsgInput<T> {
+    pub fn new(idx: usize, row: Vector<T>, col: Vector<T>) -> Self {
+        Self { idx, row, col }
+    }
+}
+
+pub struct MsgOutput<T> {
+    idx: usize,
+    value: T,
+}
+
+pub struct Msg<T> {
+    input: MsgInput<T>,
+    sender: oneshot::Sender<MsgOutput<T>>,
+}
+
+impl<T> Msg<T> {
+    pub fn new(input: MsgInput<T>, sender: oneshot::Sender<MsgOutput<T>>) -> Self {
+        Self { input, sender }
+    }
+}
+
 pub fn multiply<T>(a: &Matrix<T>, b: &Matrix<T>) -> Result<Matrix<T>>
 where
-    T: Copy + Default + Mul<Output = T> + Add<Output = T> + AddAssign,
+    T: Copy + Default + Mul<Output = T> + Add<Output = T> + AddAssign + Send + 'static,
 {
     if a.cols != b.rows {
         return Err(anyhow!("Matrix dimensions do not match"));
     }
+
+    let senders = (0..NUM_THREADS)
+        .map(|_| {
+            let (tx, rx) = mpsc::channel::<Msg<T>>();
+            thread::spawn(move || {
+                for msg in rx {
+                    let value = dot_product(msg.input.row, msg.input.col)?;
+                    if let Err(e) = msg.sender.send(MsgOutput {
+                        idx: msg.input.idx,
+                        value,
+                    }) {
+                        eprintln!("Error sending message: {}", e);
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            });
+            tx
+        })
+        .collect::<Vec<_>>();
+
     // [1,2,3,4,5,6] [10,11,20,21,30,31]
     let mut data = vec![T::default(); a.rows * b.cols];
+    let mut receivers = Vec::with_capacity(a.rows * b.cols);
     for i in 0..a.rows {
         for j in 0..b.cols {
-            for k in 0..a.cols {
-                data[i * b.cols + j] += a.data[i * a.cols + k] * b.data[k * b.cols + j];
+            // let a_row = Vector::new(a.data[i * a.cols..(i + 1) * a.cols].to_vec());
+            // let b_col = Vector::new((0..b.rows).map(|k| b.data[k * b.cols + j]).collect());
+            // data[i * b.cols + j] = dot_product(a_row, b_col)?;
+
+            let a_row = Vector::new(a.data[i * a.cols..(i + 1) * a.cols].to_vec());
+            let b_col = Vector::new((0..b.rows).map(|k| b.data[k * b.cols + j]).collect());
+            let idx = i * b.cols + j;
+            let input = MsgInput::new(idx, a_row, b_col);
+            let (tx, rx) = oneshot::channel();
+            let msg = Msg::new(input, tx);
+            if let Err(e) = senders[idx % NUM_THREADS].send(msg) {
+                eprintln!("Error sending message: {}", e);
             }
+            receivers.push(rx);
         }
+    }
+
+    for rx in receivers {
+        let ret = rx.recv()?;
+        data[ret.idx] = ret.value;
     }
 
     Ok(Matrix {
